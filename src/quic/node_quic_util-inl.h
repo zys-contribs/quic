@@ -42,6 +42,12 @@ size_t QuicCID::Hash::operator()(const QuicCID& token) const {
   return hash;
 }
 
+QuicCID& QuicCID::operator=(const QuicCID& cid) {
+  if (this == &cid) return *this;
+  this->~QuicCID();
+  return *new(this) QuicCID(std::move(cid));
+}
+
 bool QuicCID::operator==(const QuicCID& other) const {
   return memcmp(cid()->data, other.cid()->data, cid()->datalen) == 0;
 }
@@ -183,15 +189,15 @@ const char* QuicError::family_name() {
   }
 }
 
-const ngtcp2_cid* QuicPreferredAddress::cid() const {
+const ngtcp2_cid* PreferredAddress::cid() const {
   return &paddr_->cid;
 }
 
-const uint8_t* QuicPreferredAddress::stateless_reset_token() const {
+const uint8_t* PreferredAddress::stateless_reset_token() const {
   return paddr_->stateless_reset_token;
 }
 
-std::string QuicPreferredAddress::preferred_ipv6_address() const {
+std::string PreferredAddress::ipv6_address() const {
   char host[NI_MAXHOST];
   // Return an empty string if unable to convert...
   if (uv_inet_ntop(AF_INET6, paddr_->ipv6_addr, host, sizeof(host)) != 0)
@@ -199,7 +205,7 @@ std::string QuicPreferredAddress::preferred_ipv6_address() const {
 
   return std::string(host);
 }
-std::string QuicPreferredAddress::preferred_ipv4_address() const {
+std::string PreferredAddress::ipv4_address() const {
   char host[NI_MAXHOST];
   // Return an empty string if unable to convert...
   if (uv_inet_ntop(AF_INET, paddr_->ipv4_addr, host, sizeof(host)) != 0)
@@ -208,14 +214,15 @@ std::string QuicPreferredAddress::preferred_ipv4_address() const {
   return std::string(host);
 }
 
-int16_t QuicPreferredAddress::preferred_ipv6_port() const {
+uint16_t PreferredAddress::ipv6_port() const {
   return paddr_->ipv6_port;
 }
-int16_t QuicPreferredAddress::preferred_ipv4_port() const {
+
+uint16_t PreferredAddress::ipv4_port() const {
   return paddr_->ipv4_port;
 }
 
-bool QuicPreferredAddress::Use(int family) const {
+bool PreferredAddress::Use(int family) const {
   uv_getaddrinfo_t req;
 
   if (!ResolvePreferredAddress(family, &req))
@@ -227,7 +234,7 @@ bool QuicPreferredAddress::Use(int family) const {
   return true;
 }
 
-bool QuicPreferredAddress::ResolvePreferredAddress(
+bool PreferredAddress::ResolvePreferredAddress(
     int local_address_family,
     uv_getaddrinfo_t* req) const {
   int af;
@@ -323,23 +330,29 @@ template <typename T>
 StatsBase<T>::StatsBase(
     Environment* env,
     v8::Local<v8::Object> wrap,
-    int options)
-    : stats_buffer_(
-          env->isolate(),
-          sizeof(typename T::Stats) / sizeof(uint64_t),
-          reinterpret_cast<uint64_t*>(&stats_)) {
+    int options) {
   static constexpr uint64_t kMax = std::numeric_limits<int64_t>::max();
-  stats_.created_at = uv_hrtime();
 
-  // TODO(@jasnell): The follow are checks instead of handling
-  // the error. Before this code moves out of experimental,
-  // these should be change to properly handle the error.
+  // Create the backing store for the statistics
+  size_t size = sizeof(Stats);
+  size_t count = size / sizeof(uint64_t);
+  stats_store_ = v8::ArrayBuffer::NewBackingStore(env->isolate(), size);
+  stats_ = new (stats_store_->Data()) Stats;
 
-  wrap->DefineOwnProperty(
+  DCHECK_NOT_NULL(stats_);
+  stats_->created_at = uv_hrtime();
+
+  // The stats buffer is exposed as a BigUint64Array on
+  // the JavaScript side to allow statistics to be monitored.
+  v8::Local<v8::ArrayBuffer> stats_buffer =
+      v8::ArrayBuffer::New(env->isolate(), stats_store_);
+  v8::Local<v8::BigUint64Array> stats_array =
+      v8::BigUint64Array::New(stats_buffer, 0, count);
+  USE(wrap->DefineOwnProperty(
       env->context(),
       env->stats_string(),
-      stats_buffer_.GetJSArray(),
-      v8::PropertyAttribute::ReadOnly).Check();
+      stats_array,
+      v8::PropertyAttribute::ReadOnly));
 
   if (options & HistogramOptions::ACK) {
     ack_ = HistogramBase::New(env, 1, kMax);
@@ -370,28 +383,28 @@ StatsBase<T>::StatsBase(
 }
 
 template <typename T>
-void StatsBase<T>::IncrementStat(uint64_t T::Stats::*member, uint64_t amount) {
+void StatsBase<T>::IncrementStat(uint64_t Stats::*member, uint64_t amount) {
   static constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
-  stats_.*member += std::min(amount, kMax - stats_.*member);
+  stats_->*member += std::min(amount, kMax - stats_->*member);
 }
 
 template <typename T>
-void StatsBase<T>::SetStat(uint64_t T::Stats::*member, uint64_t value) {
-  stats_.*member = value;
+void StatsBase<T>::SetStat(uint64_t Stats::*member, uint64_t value) {
+  stats_->*member = value;
 }
 
 template <typename T>
-void StatsBase<T>::RecordTimestamp(uint64_t T::Stats::*member) {
-  stats_.*member = uv_hrtime();
+void StatsBase<T>::RecordTimestamp(uint64_t Stats::*member) {
+  stats_->*member = uv_hrtime();
 }
 
 template <typename T>
-uint64_t StatsBase<T>::GetStat(uint64_t T::Stats::*member) const {
-  return stats_.*member;
+uint64_t StatsBase<T>::GetStat(uint64_t Stats::*member) const {
+  return stats_->*member;
 }
 
 template <typename T>
-inline void StatsBase<T>::RecordRate(uint64_t T::Stats::*member) {
+inline void StatsBase<T>::RecordRate(uint64_t Stats::*member) {
   CHECK(rate_);
   uint64_t received_at = GetStat(member);
   uint64_t now = uv_hrtime();
@@ -407,7 +420,7 @@ inline void StatsBase<T>::RecordSize(uint64_t val) {
 }
 
 template <typename T>
-inline void StatsBase<T>::RecordAck(uint64_t T::Stats::*member) {
+inline void StatsBase<T>::RecordAck(uint64_t Stats::*member) {
   CHECK(ack_);
   uint64_t acked_at = GetStat(member);
   uint64_t now = uv_hrtime();
@@ -418,7 +431,7 @@ inline void StatsBase<T>::RecordAck(uint64_t T::Stats::*member) {
 
 template <typename T>
 void StatsBase<T>::StatsMemoryInfo(MemoryTracker* tracker) const {
-  tracker->TrackField("stats_buffer", stats_buffer_);
+  tracker->TrackField("stats_store", stats_store_);
   tracker->TrackField("rate_histogram", rate_);
   tracker->TrackField("size_histogram", size_);
   tracker->TrackField("ack_histogram", ack_);
@@ -440,7 +453,7 @@ std::string StatsBase<T>::StatsDebug::ToString() const {
     out += std::to_string(val);
     out += "\n";
   };
-  add_field("Duration", uv_hrtime() - ptr->GetStat(&T::Stats::created_at));
+  add_field("Duration", uv_hrtime() - ptr->GetStat(&Stats::created_at));
   T::ToString(*ptr, add_field);
   return out;
 }
